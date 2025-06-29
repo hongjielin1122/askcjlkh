@@ -23,20 +23,63 @@ public:
         initServer();
         
         // 启动服务器线程
+        server_running_ = true;
         server_thread_ = std::make_unique<std::thread>(&PoseTCPServer::runServer, this);
     }
     
     ~PoseTCPServer() {
-        // 停止服务器
-        server_running_ = false;
-        if (server_thread_ && server_thread_->joinable()) {
-            server_thread_->join();
+        // 主动调用关闭方法
+        shutdown();
+    }
+
+    // 显式关闭方法
+    void shutdown() {
+    if (!server_running_) return;
+    
+    RCLCPP_INFO(this->get_logger(), "开始关闭TCP服务器");
+    server_running_ = false;
+    
+    // 先关闭客户端连接
+    if (client_socket_ > 0) {
+        close(client_socket_);
+        client_socket_ = 0;
+    }
+    
+    // 关键改进：通过向服务器套接字发送假数据来中断accept()
+    if (server_socket_ > 0) {
+        // 创建临时套接字连接到自身，触发accept返回
+        int temp_socket = socket(AF_INET, SOCK_STREAM, 0);
+        if (temp_socket >= 0) {
+            struct sockaddr_in addr;
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;
+            addr.sin_port = htons(PORT);
+            
+            // 尝试连接（非阻塞）
+            connect(temp_socket, (struct sockaddr*)&addr, sizeof(addr));
+            close(temp_socket);
         }
         
-        // 关闭所有连接
-        close(client_socket_);
+        // 关闭服务器套接字
         close(server_socket_);
+        server_socket_ = 0;
     }
+    
+    // 等待TCP线程结束
+    if (server_thread_ && server_thread_->joinable()) {
+        auto future = std::async(std::launch::async, [this]() {
+            server_thread_->join();
+        });
+        
+        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+            RCLCPP_ERROR(this->get_logger(), "TCP线程超时未结束！");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "TCP线程已成功结束");
+        }
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "TCP服务器已关闭");
+}
 
 private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr subscription_;
@@ -45,15 +88,18 @@ private:
     std::unique_ptr<std::thread> server_thread_;
     std::mutex pose_mutex_;
     geometry_msgs::msg::PoseStamped current_pose_;
-    std::atomic<bool> server_running_{true};
+    std::atomic<bool> server_running_{false};
 
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
         // 更新当前位姿
         std::lock_guard<std::mutex> lock(pose_mutex_);
         current_pose_ = *msg;
-        RCLCPP_INFO(this->get_logger(), "recivepos");
-        // 发送位姿数据到客户端
-        sendPoseToClient();
+        RCLCPP_INFO(this->get_logger(), "接收到位姿数据");
+        
+        // 发送位姿数据到客户端（添加客户端连接检查）
+        if (client_socket_ > 0) {
+            sendPoseToClient();
+        }
     }
     
     void initServer() {
@@ -98,32 +144,43 @@ private:
         while (server_running_) {
             RCLCPP_INFO(this->get_logger(), "等待客户端连接...");
             
-            // 接受连接
-            if ((client_socket_ = accept(server_socket_, (struct sockaddr *)&client_address, 
-                                        (socklen_t*)&addrlen)) < 0) {
+            // 重置客户端套接字
+            client_socket_ = 0;
+            
+            // 接受连接（添加中断处理）
+            int accept_ret = accept(server_socket_, (struct sockaddr *)&client_address, 
+                                  (socklen_t*)&addrlen);
+                                  
+            if (accept_ret < 0) {
                 if (server_running_) {
-                    RCLCPP_ERROR(this->get_logger(), "接受连接失败");
+                    RCLCPP_ERROR(this->get_logger(), "接受连接失败: %d", errno);
                 }
                 continue;
             }
             
+            client_socket_ = accept_ret;
             RCLCPP_INFO(this->get_logger(), "客户端已连接: %s", inet_ntoa(client_address.sin_addr));
             
-            // 保持连接，直到客户端断开
-            while (server_running_) {
-                // 检查连接状态
-                char test;
-                int valread = recv(client_socket_, &test, 1, MSG_PEEK);
-                if (valread <= 0) {
-                    RCLCPP_INFO(this->get_logger(), "客户端断开连接");
-                    close(client_socket_);
-                    client_socket_ = 0;
-                    break;
-                }
-                
-                // 短暂休眠避免CPU占用过高
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // 处理客户端连接（带终止检查）
+            handleClient();
+        }
+    }
+    
+    void handleClient() {
+        while (server_running_ && client_socket_ > 0) {
+            // 检查客户端连接状态
+            char buffer[1];
+            int valread = recv(client_socket_, buffer, 1, MSG_PEEK);
+            
+            if (valread <= 0) {
+                RCLCPP_INFO(this->get_logger(), "客户端断开连接");
+                close(client_socket_);
+                client_socket_ = 0;
+                break;
             }
+            
+            // 短暂休眠避免CPU占用过高
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
     
@@ -147,49 +204,40 @@ private:
         
         std::string message = ss.str();
         
-        // 发送消息
-        if (send(client_socket_, message.c_str(), message.length(), 0) < 0) {
-            RCLCPP_WARN(this->get_logger(), "发送数据失败，可能客户端已断开");
+        // 发送消息（增强错误处理）
+        int send_ret = send(client_socket_, message.c_str(), message.length(), 0);
+        if (send_ret < 0) {
+            RCLCPP_WARN(this->get_logger(), "发送数据失败，错误码: %d", errno);
             close(client_socket_);
             client_socket_ = 0;
-        }else{
-            RCLCPP_INFO(this->get_logger(), "发送数据");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "成功发送位姿数据，字节数: %d", send_ret);
         }
     }
-    void shutdown() {
-    server_running_ = false;
-    
-    // 关闭TCP连接
-    if (client_socket_ > 0) {
-        shutdown(client_socket_, SHUT_RDWR);  // 先优雅关闭读写
-        close(client_socket_);
-    }
-    if (server_socket_ > 0) close(server_socket_);
-    
-    // 等待TCP线程结束（最多5秒）
-    if (server_thread_ && server_thread_->joinable()) {
-        auto future = std::async(std::launch::async, [this]() {
-            server_thread_->join();
-        });
-        
-        if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-            std::cerr << "TCP线程超时未结束，强制终止" << std::endl;
-            // 若线程仍不结束，可通过系统调用强制终止
-        }
-    }
-}
 };
 
 
 // 全局标志，用于通知所有线程退出
 std::atomic<bool> g_terminate(false);
 
-// 信号处理函数
+// 信号处理函数（增强版）
 void signalHandler(int signum) {
-    std::cout << "接收到终止信号 " << signum << ", 正在优雅退出..." << std::endl;
+    std::cout<<"接收到终止信号 "<<signum<<"启动优雅关闭流程"<<std::endl;
     g_terminate = true;
+    
+    // 触发ROS 2关闭
     rclcpp::shutdown();
+    
+    // 记录当前时间，用于超时控制
+    auto start_time = std::chrono::system_clock::now();
+    
+    // 等待ROS节点完成关闭（带超时）
+    while (rclcpp::ok() && 
+           std::chrono::system_clock::now() - start_time < std::chrono::seconds(10)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
+
 int main(int argc, char * argv[]) {
     // 设置信号处理
     signal(SIGINT, signalHandler);
@@ -214,17 +262,16 @@ int main(int argc, char * argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     
+    std::cout<<"主线程接收到终止信号，等待资源释放"<<std::endl;
+    
     // 等待ROS 2线程结束
     if (spin_thread.joinable()) {
         spin_thread.join();
     }
     
-    // 显式调用节点析构函数（确保资源释放）
+    // 显式释放节点资源
     node.reset();
     
-    // 关闭ROS 2
-    rclcpp::shutdown();
-    
-    std::cout << "节点已成功关闭" << std::endl;
+    std::cout<< "节点已成功关闭"<<std::endl;
     return 0;
 }
